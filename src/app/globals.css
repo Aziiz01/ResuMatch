@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+/* Class-based dark mode for Tailwind v4 (`dark` on <html>) */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Theme tokens (light default). `.dark` overrides — next-themes toggles `class="dark"` on <html>.
+ */
+:root {
+  color-scheme: light;
+  --background: #f1f5f9;
+  --foreground: #0f172a;
+  --muted: #64748b;
+  --card: #ffffff;
+  --card-border: #e2e8f0;
+  --input-bg: #f8fafc;
+  --input-border: #cbd5e1;
+  --ring: #10b981;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: #09090b;
+  --foreground: #fafafa;
+  --muted: #a1a1aa;
+  --card: #18181b;
+  --card-border: #27272a;
+  --input-bg: #09090b;
+  --input-border: #3f3f46;
+  --ring: #34d399;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html {
+  /* Fallback when View Transitions API is unavailable */
+  transition: background-color 0.45s cubic-bezier(0.4, 0, 0.2, 1), color 0.35s ease;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  transition: background-color 0.45s cubic-bezier(0.4, 0, 0.2, 1), color 0.35s ease;
+}
+
+/*
+ * Smooth cross-fade when toggling `dark` (Chromium 111+, Safari 18+, Firefox 129+).
+ * @see https://developer.mozilla.org/en-US/docs/Web/API/View_Transition_API
+ */
+@supports (view-transition-name: none) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 0.45s;
+    animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    transition: none;
+  }
+
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 0.001ms !important;
+  }
+}
+
+textarea:focus-visible,
+button:focus-visible {
+  outline: none;
+}
