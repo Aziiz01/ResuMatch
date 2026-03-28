@@ -1,0 +1,2 @@
+declare module "latex.js";
+
