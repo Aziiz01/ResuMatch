@@ -11,8 +11,18 @@ import { NextResponse } from "next/server";
  * Response: { "embeddings": number[][] } — one vector per input string.
  */
 
-const DEFAULT_MODEL =
-  process.env.HF_EMBEDDINGS_MODEL ?? "sentence-transformers/all-MiniLM-L6-v2";
+/** Strong retrieval / similarity models (feature extraction). Tried in order if unset. */
+const EMBEDDING_MODEL_DEFAULTS = [
+  "BAAI/bge-large-en-v1.5",
+  "intfloat/e5-large-v2",
+  "sentence-transformers/all-mpnet-base-v2",
+] as const;
+
+function embeddingCandidates(): string[] {
+  const env = process.env.HF_EMBEDDINGS_MODEL?.trim();
+  if (env) return [env];
+  return [...EMBEDDING_MODEL_DEFAULTS];
+}
 
 function meanPool(tokenRows: number[][]): number[] {
   const dim = tokenRows[0].length;
@@ -86,27 +96,42 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "texts[] required" }, { status: 400 });
   }
 
-  console.log("[api/embeddings] model=%s batchSize=%d", DEFAULT_MODEL, texts.length);
+  const models = embeddingCandidates();
+  console.log("[api/embeddings] candidates=%s batchSize=%d", JSON.stringify(models), texts.length);
 
   const client = new InferenceClient(token);
+  const tried: string[] = [];
 
-  try {
-    const raw = await client.featureExtraction({
-      model: DEFAULT_MODEL,
-      inputs: texts,
-    });
-
-    const embeddings = normalizeEmbeddings(raw, texts.length);
-    return NextResponse.json({ embeddings, model: DEFAULT_MODEL });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return NextResponse.json(
-      {
-        error: "Hugging Face embeddings request failed",
-        detail: msg,
-        hint: "Confirm HF_TOKEN is valid and has Inference API access; try another HF_EMBEDDINGS_MODEL if the model is unavailable.",
-      },
-      { status: 502 },
-    );
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    try {
+      const raw = await client.featureExtraction({
+        model,
+        inputs: texts,
+      });
+      const embeddings = normalizeEmbeddings(raw, texts.length);
+      if (i > 0) {
+        console.log("[api/embeddings] success after fallback model=%s", model);
+      }
+      return NextResponse.json({ embeddings, model });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      tried.push(`${model}: ${msg.slice(0, 200)}`);
+      const isLast = i === models.length - 1;
+      if (isLast) {
+        return NextResponse.json(
+          {
+            error: "Hugging Face embeddings request failed for all candidate models",
+            detail: msg,
+            attempted: tried,
+            hint: "Confirm HF_TOKEN and Inference Providers; set HF_EMBEDDINGS_MODEL to a model you can run (e.g. BAAI/bge-large-en-v1.5).",
+          },
+          { status: 502 },
+        );
+      }
+      console.log("[api/embeddings] model=%s failed, trying next: %s", model, msg.slice(0, 120));
+    }
   }
+
+  return NextResponse.json({ error: "No embedding models to try" }, { status: 500 });
 }

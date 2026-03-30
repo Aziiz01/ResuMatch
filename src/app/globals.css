@@ -75,3 +75,33 @@ textarea:focus-visible,
 button:focus-visible {
   outline: none;
 }
+
+/* Glowing CTA (respect reduced motion) */
+@keyframes rate-project-glow {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px rgba(34, 211, 238, 0.35),
+      0 0 18px rgba(34, 211, 238, 0.35),
+      0 0 36px rgba(56, 189, 248, 0.12);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px rgba(34, 211, 238, 0.55),
+      0 0 26px rgba(34, 211, 238, 0.55),
+      0 0 48px rgba(56, 189, 248, 0.22);
+  }
+}
+
+.rate-project-glow {
+  animation: rate-project-glow 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rate-project-glow {
+    animation: none;
+    box-shadow:
+      0 0 0 1px rgba(34, 211, 238, 0.4),
+      0 0 16px rgba(34, 211, 238, 0.35);
+  }
+}
