@@ -25,10 +25,10 @@ export function SkillMatchPanel({ results, matchPct, semanticAvailable }: Props)
         <div>
           <h2 className="text-lg font-semibold tracking-tight text-slate-900 dark:text-zinc-100">Skill match</h2>
           <p className="text-sm text-slate-600 dark:text-zinc-500">
-            Green = present (keyword or embedding similarity). Red = gap.{" "}
+            Green = found in résumé (exact keyword or strong embedding match vs your text). Red = gap. Semantic
+            matches use a strict, job-relative cutoff so scores are not all 100%.{" "}
             {!semanticAvailable && (
-              <span className="text-amber-700 dark:text-amber-400/90">
-              </span>
+              <span className="text-amber-700 dark:text-amber-400/90"></span>
             )}
           </p>
         </div>

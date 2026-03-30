@@ -14,8 +14,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Resume & Job Matcher",
-  description: "Compare your resume to a job posting with keyword + semantic skill matching and AI bullet suggestions.",
+  title: "ResuMatch — CV & job matching",
+  description:
+    "ResuMatch by Aziz: align your resume to a job posting with skill matching, AI suggestions, and LaTeX CV export.",
 };
 
 export default function RootLayout({

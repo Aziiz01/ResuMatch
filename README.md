@@ -61,9 +61,11 @@ Open [http://localhost:3000](http://localhost:3000) after `npm run dev`.
 
 ## Configuration
 
-- **`HF_TOKEN`** (required for API features) — Inference API token.  
-- **`HF_EMBEDDINGS_MODEL`** — Optional override for the embeddings model used for semantic skill scoring.  
-- **`HF_GENERATE_MODEL`** — Optional override for chat/text-generation models (see comments in `.env.example` for chat vs text2text models).
+- **`HF_TOKEN`** (required for API features) — Hugging Face token with access to [Inference Providers](https://huggingface.co/settings/inference-providers).
+- **`HF_EMBEDDINGS_MODEL`** — Optional. If unset, `/api/embeddings` tries in order: **BGE-large-en-v1.5**, **E5-large-v2**, **all-mpnet-base-v2** (strong defaults for semantic skill matching).
+- **`HF_GENERATE_MODEL`** — Optional. If unset, `/api/generate` tries in order: **`meta-llama/Llama-3.1-8B-Instruct`**, **`Qwen/Qwen2.5-7B-Instruct`**, **`mistralai/Mistral-7B-Instruct-v0.3`** (longer completions, better for CV/LaTeX text).
+
+Some models (e.g. Llama) are **gated**: visit the model page on Hugging Face and accept the license while logged in, then reuse the same token.
 
 Do not commit `.env.local` or real tokens. The repository includes `.env.example` only as a template.
 

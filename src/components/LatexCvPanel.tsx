@@ -2,6 +2,12 @@
 
 import { motion } from "framer-motion";
 import { useEffect, useMemo, useState } from "react";
+import {
+  buildLatexPreviewSource,
+  buildPreviewFallbackHtml,
+  escalatePreviewForLatexJs,
+  finalizePreviewSource,
+} from "@/lib/latexPreviewSanitize";
 
 type Tab = "code" | "preview";
 
@@ -15,246 +21,6 @@ type Props = {
 };
 
 const LATEX_CDN_BASE = "https://cdn.jsdelivr.net/npm/latex.js@0.12.6/dist/";
-
-function extractCodeFences(input: string): string {
-  const fence = input.match(/```(?:latex)?\s*([\s\S]*?)```/i);
-  return fence ? fence[1].trim() : input.trim();
-}
-
-/**
- * latex.js loads each \\usepackage via dynamic imports in the browser; many CTAN
- * packages are not bundled → console noise and broken preview. Preview uses a
- * package-free subset; users keep full \\usepackage list in the editor / .tex download.
- */
-function stripPreviewIncompatiblePreamble(src: string): { text: string; stripped: boolean } {
-  const normalized = src.replace(/\r\n/g, "\n");
-  const lines = normalized.split("\n");
-  const out: string[] = [];
-  let stripped = false;
-
-  for (const line of lines) {
-    const t = line.trim();
-    if (
-      /\\usepackage\b/.test(t) ||
-      /\\RequirePackage\b/.test(t) ||
-      /\\PassOptionsToPackage\b/.test(t)
-    ) {
-      stripped = true;
-      continue;
-    }
-    out.push(line);
-  }
-
-  return {
-    text: out.join("\n").replace(/\n{3,}/g, "\n\n"),
-    stripped,
-  };
-}
-
-/** Matches \\begin{document} with optional spaces (latex.js is stricter than this regex). */
-const RE_BEGIN_DOC = /\\begin\s*\{\s*document\s*\}/;
-const RE_END_DOC = /\\end\s*\{\s*document\s*\}/;
-
-function stripBomAndFixBackslashes(src: string): string {
-  return src
-    .replace(/^\uFEFF/, "")
-    .replace(/\uFF3C/g, "\\"); // fullwidth reverse solidus → backslash
-}
-
-/**
- * latex.js parses the full preamble; after stripping \\usepackage, leftover commands like
- * \\geometry or font setup can leave the parser expecting \\begin{document} in the wrong state.
- * For preview, keep only the document body and wrap with a minimal article preamble.
- */
-function isolateDocumentBodyForPreview(src: string): { source: string; simplified: boolean } {
-  const paired = src.match(
-    new RegExp(`${RE_BEGIN_DOC.source}([\\s\\S]*?)${RE_END_DOC.source}`, "m"),
-  );
-  if (paired) {
-    return {
-      source: `\\documentclass{article}
-\\begin{document}
-${paired[1].trim()}
-\\end{document}`,
-      simplified: true,
-    };
-  }
-
-  const open = src.match(new RegExp(`${RE_BEGIN_DOC.source}([\\s\\S]*)$`, "m"));
-  if (open) {
-    return {
-      source: `\\documentclass{article}
-\\begin{document}
-${open[1].trim()}
-\\end{document}`,
-      simplified: true,
-    };
-  }
-
-  return { source: src, simplified: false };
-}
-
-function hasBeginDocument(src: string): boolean {
-  return RE_BEGIN_DOC.test(src);
-}
-
-/** Environments that often break latex.js preview when \\begin/\\end counts disagree. */
-const PREVIEW_BALANCE_ENVS = new Set(["itemize", "enumerate", "description", "tabular"]);
-
-/**
- * Append missing \\end{...} at EOF in stack order (models sometimes omit the last \\end{itemize}).
- * Only handles well-nested markup; mismatched \\end in the middle may still fail to parse.
- */
-function balanceTrackedEnvironments(body: string): { text: string; fixed: boolean } {
-  const stack: string[] = [];
-  const re = /\\(begin|end)\{([^}]+)\}/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body)) !== null) {
-    const cmd = m[1];
-    const env = m[2].trim();
-    if (!PREVIEW_BALANCE_ENVS.has(env)) continue;
-    if (cmd === "begin") {
-      stack.push(env);
-    } else if (stack.length > 0 && stack[stack.length - 1] === env) {
-      stack.pop();
-    }
-  }
-  if (stack.length === 0) return { text: body, fixed: false };
-  const suffix = [...stack].reverse().map((e) => `\\end{${e}}`).join("\n");
-  return { text: `${body.trimEnd()}\n${suffix}\n`, fixed: true };
-}
-
-function balancePreviewDocument(src: string): { source: string; fixed: boolean } {
-  // No multiline flag: ^/$ must be whole string so body is not truncated at an inner newline.
-  const match = src.match(
-    new RegExp(`^([\\s\\S]*?${RE_BEGIN_DOC.source})([\\s\\S]*?)(${RE_END_DOC.source})\\s*$`),
-  );
-  if (!match) return { source: src, fixed: false };
-  const [, head, body, tail] = match;
-  const balanced = balanceTrackedEnvironments(body);
-  if (!balanced.fixed) return { source: src, fixed: false };
-  return { source: `${head}${balanced.text}${tail}`, fixed: true };
-}
-
-/**
- * LaTeX.js does not implement several NFSS/font primitives (e.g. \\fontsize, \\selectfont).
- * Strip them for preview only; the editor / .tex download stay unchanged.
- */
-function stripUnsupportedPreviewMacros(src: string): { text: string; stripped: boolean } {
-  const before = src;
-  let text = src
-    .replace(/\\fontsize\s*\{[^}]*\}\s*\{[^}]*\}(?:\s*\\selectfont)?/g, "")
-    .replace(/\\selectfont\b/g, "")
-    .replace(/\\fontseries\s*\{[^}]*\}/g, "")
-    .replace(/\\fontshape\s*\{[^}]*\}/g, "")
-    .replace(/\\fontencoding\s*\{[^}]*\}/g, "")
-    .replace(/\\fontfamily\s*\{[^}]*\}/g, "")
-    .replace(/\\linespread\s*\{[^}]*\}/g, "")
-    .replace(/\n{3,}/g, "\n\n");
-  return { text, stripped: text !== before };
-}
-
-/**
- * LaTeX.js errors with "group argument expected" if \\title / \\author / \\date lack `{...}`.
- * Models sometimes emit bare commands or unbraced one-line titles.
- * Skips lines where the argument `{...}` opens on the following line (valid LaTeX).
- */
-function fixTitleAuthorDateForPreview(src: string): { text: string; fixed: boolean } {
-  const before = src;
-  const lines = src.split("\n");
-  const nextMeaningfulLine = (from: number): string => {
-    for (let j = from + 1; j < lines.length; j++) {
-      const t = lines[j].trim();
-      if (t.length > 0) return lines[j];
-    }
-    return "";
-  };
-
-  for (let i = 0; i < lines.length; i++) {
-    for (const cmd of ["title", "author", "date"] as const) {
-      const bareOnly = new RegExp(`^(\\s*)\\\\${cmd}\\s*$`);
-      const m = lines[i].match(bareOnly);
-      if (!m) continue;
-      const next = nextMeaningfulLine(i).trimStart();
-      if (next.startsWith("{") || next.startsWith("[")) continue;
-      lines[i] = `${m[1]}\\${cmd}{}`;
-    }
-  }
-
-  let text = lines.join("\n");
-  for (const cmd of ["title", "author", "date"] as const) {
-    text = text.replace(
-      new RegExp(`\\\\${cmd}\\s+(?!\\[)(?!\\{)([^\\n]+)`, "g"),
-      (_whole, rest: string) => `\\${cmd}{${rest.trimEnd()}}`,
-    );
-  }
-  return { text, fixed: text !== before };
-}
-
-function normalizeLatexForPreview(input: string): { source: string; warning: string | null } {
-  let src = stripBomAndFixBackslashes(extractCodeFences(input));
-  const warnings: string[] = [];
-
-  const { text, stripped } = stripPreviewIncompatiblePreamble(src);
-  src = text;
-
-  let simplified = false;
-  if (hasBeginDocument(src)) {
-    const isolated = isolateDocumentBodyForPreview(src);
-    src = isolated.source;
-    simplified = isolated.simplified;
-  } else {
-    // Body-only / fragment: wrap into a minimal article document.
-    src = `\\documentclass{article}
-\\begin{document}
-${src.trim()}
-\\end{document}`;
-    warnings.push("No \\begin{document} found; content was wrapped in a minimal article for preview.");
-  }
-
-  const macroStripped = stripUnsupportedPreviewMacros(src);
-  src = macroStripped.text;
-  if (macroStripped.stripped) {
-    warnings.push(
-      "NFSS/font commands not supported by LaTeX.js preview (e.g. \\fontsize, \\selectfont, \\linespread) were removed for preview only.",
-    );
-  }
-
-  const titleFixed = fixTitleAuthorDateForPreview(src);
-  src = titleFixed.text;
-  if (titleFixed.fixed) {
-    warnings.push(
-      "\\title / \\author / \\date were normalized to use `{...}` where needed for LaTeX.js preview.",
-    );
-  }
-
-  if (stripped || simplified) {
-    const bits: string[] = [];
-    if (stripped) {
-      bits.push(
-        "\\usepackage lines are removed (LaTeX.js cannot load most CTAN packages in the browser)",
-      );
-    }
-    if (simplified) {
-      bits.push(
-        "only the text between \\begin{document} and \\end{document} is shown, inside a minimal preamble",
-      );
-    }
-    warnings.push(
-      `Preview note: ${bits.join("; ")}. The editor and downloaded .tex still contain your full source—compile locally with pdflatex or xelatex for the real layout.`,
-    );
-  }
-
-  const balanced = balancePreviewDocument(src);
-  if (balanced.fixed) {
-    src = balanced.source;
-    warnings.push(
-      "Missing \\end{…} for list or tabular environments was auto-inserted at the end of the document body for preview (fix the LaTeX in the editor for a valid .tex).",
-    );
-  }
-
-  return { source: src, warning: warnings.length ? warnings.join(" ") : null };
-}
 
 /**
  * Generates, edits, and previews a full LaTeX CV.
@@ -270,30 +36,27 @@ export function LatexCvPanel({
 }: Props) {
   const [activeTab, setActiveTab] = useState<Tab>("code");
   const [previewHtml, setPreviewHtml] = useState<string>("");
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const [previewWarning, setPreviewWarning] = useState<string | null>(null);
+  const [previewIsFallback, setPreviewIsFallback] = useState(false);
 
   const hasLatex = latexCode.trim().length > 0;
 
   useEffect(() => {
     if (!hasLatex) {
       setPreviewHtml("");
-      setPreviewError(null);
-      setPreviewWarning(null);
+      setPreviewIsFallback(false);
       return;
     }
 
     const timer = setTimeout(async () => {
-      try {
-        const normalized = normalizeLatexForPreview(latexCode);
-        setPreviewWarning(normalized.warning);
+      const base = buildLatexPreviewSource(latexCode);
 
+      const tryParseAndBuildHtml = async (source: string): Promise<string> => {
         const latex = await import("latex.js");
         const generator = new (latex as unknown as { HtmlGenerator: new (opts: { hyphenate: boolean }) => unknown }).HtmlGenerator({
           hyphenate: false,
         });
         const parsed = (latex as unknown as { parse: (src: string, opts: { generator: unknown }) => unknown }).parse(
-          normalized.source,
+          source,
           { generator },
         ) as {
           stylesAndScripts: (base: string) => Node;
@@ -303,22 +66,39 @@ export function LatexCvPanel({
         const doc = document.implementation.createHTMLDocument("latex-preview");
         doc.head.appendChild(parsed.stylesAndScripts(LATEX_CDN_BASE));
         doc.body.appendChild(parsed.domFragment());
+        return `<!doctype html>${doc.documentElement.outerHTML}`;
+      };
 
-        const wrapped = `<!doctype html>${doc.documentElement.outerHTML}`;
-        setPreviewHtml(wrapped);
-        setPreviewError(null);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : "Could not render LaTeX preview.";
-        setPreviewError(`${msg}. Try adding a complete document with \\begin{document} ... \\end{document}.`);
+      const attempts: { label: string; source: string }[] = [
+        { label: "full", source: base.source },
+        { label: "no-tables", source: finalizePreviewSource(escalatePreviewForLatexJs(base.source, 1)) },
+        { label: "simplified-headings", source: finalizePreviewSource(escalatePreviewForLatexJs(base.source, 2)) },
+      ];
+
+      let rendered = false;
+
+      for (let i = 0; i < attempts.length; i++) {
+        try {
+          const html = await tryParseAndBuildHtml(attempts[i].source);
+          setPreviewHtml(html);
+          setPreviewIsFallback(false);
+          rendered = true;
+          break;
+        } catch {
+          /* try next */
+        }
+      }
+
+      if (!rendered) {
+        setPreviewHtml(buildPreviewFallbackHtml(base.source));
+        setPreviewIsFallback(true);
       }
     }, 200);
 
     return () => clearTimeout(timer);
   }, [hasLatex, latexCode]);
 
-  const downloadHtml = useMemo(() => {
-    return !!previewHtml && !previewError;
-  }, [previewHtml, previewError]);
+  const downloadHtml = useMemo(() => !!previewHtml, [previewHtml]);
 
   const onDownloadPreviewHtml = () => {
     if (!downloadHtml) return;
@@ -336,6 +116,25 @@ export function LatexCvPanel({
       layout
       className="rounded-2xl border border-slate-200/90 bg-white/90 p-5 shadow-md shadow-slate-200/60 dark:border-white/10 dark:bg-white/[0.04] dark:shadow-xl dark:shadow-black/20"
     >
+      <div
+        className="mb-4 flex items-start gap-3 rounded-xl border border-amber-200/90 bg-amber-50/95 px-4 py-3 text-sm leading-snug text-amber-950 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100"
+        role="status"
+      >
+        <span className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden>
+          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M11.42 15.17L17.25 21A2.652 2.652 0 0021 17.25l-5.877-5.877M11.42 15.17l2.496-3.03c.317-.384.74-.626 1.208-.766M11.42 15.17l-4.655-5.653a2.548 2.548 0 00-3.586 0L2.5 12.5m8.92 2.67l-1.17-1.17m0 0a2.5 2.5 0 01-3.54-3.54l1.17 1.17M9.75 9.75l-1.5-1.5"
+            />
+          </svg>
+        </span>
+        <p>
+          <span className="font-semibold">Work in progress.</span> LaTeX generation and in-browser preview are still
+          under active development — better rendering and quality-of-life updates are on the way.
+        </p>
+      </div>
+
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold tracking-tight text-slate-900 dark:text-zinc-100">
@@ -379,15 +178,10 @@ export function LatexCvPanel({
         </div>
       )}
 
-      {previewError && (
-        <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100">
-          Preview error: {previewError}
-        </div>
-      )}
-
-      {previewWarning && (
-        <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-900 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-100">
-          {previewWarning}
+      {previewIsFallback && (
+        <div className="mb-3 rounded-lg border border-violet-200 bg-violet-50 px-3 py-2 text-sm text-violet-900 dark:border-violet-500/30 dark:bg-violet-500/10 dark:text-violet-100">
+          In-browser LaTeX could not fully render this document. Showing a compatibility preview below—use{" "}
+          <strong>Download .tex</strong> and compile locally for the real layout.
         </div>
       )}
 
@@ -429,8 +223,8 @@ export function LatexCvPanel({
             <iframe
               title="LaTeX CV Preview"
               srcDoc={previewHtml}
-              sandbox=""
-              className="h-[560px] w-full bg-white"
+              sandbox="allow-scripts allow-same-origin"
+              className="h-[560px] w-full bg-white dark:bg-zinc-950"
             />
           ) : (
             <div className="flex h-[320px] items-center justify-center bg-slate-50 text-sm text-slate-600 dark:bg-zinc-950/50 dark:text-zinc-500">
@@ -442,4 +236,3 @@ export function LatexCvPanel({
     </motion.section>
   );
 }
-

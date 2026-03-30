@@ -1,13 +1,9 @@
-import { InferenceClient } from "@huggingface/inference";
 import { NextResponse } from "next/server";
 
 /**
- * Resume bullet rewrites via Hugging Face Inference.
+ * Resume and CV text generation via Hugging Face Inference Router chat completions.
  *
- * - **Chat / instruct models** → `POST /v1/chat/completions` (OpenAI-style `messages`).
- * - **Text2text models** (e.g. `google/flan-t5-small`) → **not** chat models. They use the
- *   HF Inference text-generation route: `router.huggingface.co/hf-inference/models/<model>`
- *   with `{ inputs, parameters }`, via `@huggingface/inference` `textGeneration` + `endpointUrl`.
+ * `POST https://router.huggingface.co/v1/chat/completions` (OpenAI-style `messages`).
  *
  * Request body: { "prompt": string }
  * Response: { "text": string, "model": string }
@@ -15,26 +11,18 @@ import { NextResponse } from "next/server";
 
 const ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions";
 
-/** Models that must use text-generation, not chat completions. */
-function isText2TextModel(modelId: string): boolean {
-  return /^google\/flan-t5-(small|base|large|xl|xxl)$/.test(modelId);
-}
-
-function hfInferenceModelUrl(modelId: string): string {
-  return `https://router.huggingface.co/hf-inference/models/${modelId}`;
-}
-
 /**
- * Chat fallbacks when `HF_GENERATE_MODEL` is unset (instruct / chat models only).
+ * Default chat models when `HF_GENERATE_MODEL` is unset (strong instruct models on the HF router).
+ * Order: try first, then fall back on provider errors or overload (502/503).
  */
 const ROUTER_MODEL_FALLBACKS = [
-  "meta-llama/Llama-3.2-1B-Instruct",
-  "Qwen/Qwen2.5-1.5B-Instruct",
+  "meta-llama/Llama-3.1-8B-Instruct",
+  "Qwen/Qwen2.5-7B-Instruct",
   "mistralai/Mistral-7B-Instruct-v0.3",
 ] as const;
 
-/** Default when unset: user-requested text2text model. */
-const DEFAULT_MODEL = "google/flan-t5-small";
+/** Enough room for CV suggestions and LaTeX blocks without truncating mid-sentence. */
+const MAX_COMPLETION_TOKENS = 2048;
 
 type RouterError = {
   error?: { message?: string; type?: string };
@@ -50,7 +38,7 @@ function summarizeRouterFailure(status: number, body: unknown, rawText: string):
       return JSON.stringify(body).slice(0, 900);
     } catch {
       /* fall through */
-    } 
+    }
   }
   return rawText.slice(0, 600) || `HTTP ${status}`;
 }
@@ -66,56 +54,6 @@ function shouldTryNextFallback(status: number, detail: string): boolean {
   return false;
 }
 
-/**
- * FLAN-T5 / text2text: classic HF inference payload (not chat).
- */
-async function routerTextGenerationOnce(
-  token: string,
-  model: string,
-  prompt: string,
-): Promise<
-  | { ok: true; text: string; model: string }
-  | { ok: false; status: number; detail: string; parsed?: unknown }
-> {
-  const client = new InferenceClient(token);
-  const endpointUrl = hfInferenceModelUrl(model);
-
-  try {
-    const out = await client.textGeneration({
-      model,
-      endpointUrl,
-      inputs: prompt,
-      parameters: {
-        max_new_tokens: 220,
-        temperature: 0.65,
-        return_full_text: false,
-      },
-    });
-
-    const generated =
-      out &&
-      typeof out === "object" &&
-      "generated_text" in out &&
-      typeof (out as { generated_text: unknown }).generated_text === "string"
-        ? (out as { generated_text: string }).generated_text
-        : "";
-
-    const text = generated.trim();
-    if (!text) {
-      return {
-        ok: false,
-        status: 502,
-        detail: "Empty generated_text from text-generation API",
-        parsed: out,
-      };
-    }
-    return { ok: true, text, model };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return { ok: false, status: 502, detail: msg };
-  }
-}
-
 async function routerChatOnce(
   token: string,
   model: string,
@@ -127,8 +65,8 @@ async function routerChatOnce(
   const payload = {
     model,
     messages: [{ role: "user" as const, content: prompt }],
-    max_tokens: 220,
-    temperature: 0.65,
+    max_tokens: MAX_COMPLETION_TOKENS,
+    temperature: 0.7,
   };
 
   const run = async () => {
@@ -203,9 +141,7 @@ export async function POST(req: Request) {
   }
 
   const explicit = process.env.HF_GENERATE_MODEL?.trim();
-  const candidates = explicit
-    ? [explicit]
-    : [DEFAULT_MODEL, ...ROUTER_MODEL_FALLBACKS];
+  const candidates = explicit ? [explicit] : [...ROUTER_MODEL_FALLBACKS];
 
   console.log("[api/generate] HF_GENERATE_MODEL=%s → candidates=%s", explicit ?? "(unset)", JSON.stringify(candidates));
 
@@ -214,21 +150,12 @@ export async function POST(req: Request) {
 
     for (let i = 0; i < candidates.length; i++) {
       const model = candidates[i];
-      const mode = isText2TextModel(model) ? "text-generation" : "chat";
-      console.log(
-        "[api/generate] try %d/%d model=%s mode=%s",
-        i + 1,
-        candidates.length,
-        model,
-        mode,
-      );
+      console.log("[api/generate] try %d/%d model=%s", i + 1, candidates.length, model);
 
-      const result = isText2TextModel(model)
-        ? await routerTextGenerationOnce(token, model, prompt)
-        : await routerChatOnce(token, model, prompt);
+      const result = await routerChatOnce(token, model, prompt);
 
       if (result.ok) {
-        console.log("[api/generate] success model=%s mode=%s", result.model, mode);
+        console.log("[api/generate] success model=%s", result.model);
         return NextResponse.json({ text: result.text, model: result.model });
       }
 
@@ -241,7 +168,8 @@ export async function POST(req: Request) {
         !explicit &&
         !isLast &&
         (shouldTryNextFallback(result.status, result.detail) ||
-          (isText2TextModel(model) && (result.status === 502 || result.status === 503)));
+          result.status === 502 ||
+          result.status === 503);
 
       if (!canFallback) {
         console.log("[api/generate] no further fallback; returning error for model=%s", model);
@@ -253,11 +181,10 @@ export async function POST(req: Request) {
             detail: result.detail,
             upstreamStatus: result.status,
             model,
-            mode: isText2TextModel(model) ? "text-generation" : "chat",
+            mode: "chat",
             ...(tried.length > 1 && { attempted: tried.slice(0, -1) }),
-            hint: isText2TextModel(model)
-              ? "Text2text models (e.g. FLAN-T5) use /hf-inference/models/..., not chat. If this fails, check HF_TOKEN and that the model is available on Inference Providers."
-              : explicit === undefined
+            hint:
+              explicit === undefined
                 ? "Enable inference providers at https://hf.co/settings/inference-providers or set HF_GENERATE_MODEL."
                 : "Set HF_GENERATE_MODEL to a model your enabled providers support.",
           },
@@ -273,7 +200,7 @@ export async function POST(req: Request) {
       {
         error: "All candidate models failed",
         attempted: tried,
-        hint: "Set HF_GENERATE_MODEL=google/flan-t5-small for FLAN-T5, or enable providers for chat fallbacks.",
+        hint: "Accept the model license on huggingface.co if required (e.g. Llama), enable Inference Providers, or set HF_GENERATE_MODEL to a model your account can run.",
       },
       { status: 502 },
     );

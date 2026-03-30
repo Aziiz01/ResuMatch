@@ -62,7 +62,7 @@ function tokenCandidates(chunk: string): string[] {
   const cleaned = chunk.replace(/^[-*•\d.)]+\s*/, "").trim();
   if (cleaned.length < 2) return out;
   out.push(cleaned);
-  cleaned.split(/[/|+&,]/).forEach((bit) => {
+  cleaned.split(/[/|+&,\uFF0C，、]/).forEach((bit) => {
     const t = bit.trim();
     if (t.length >= 2) out.push(t);
   });
@@ -118,21 +118,43 @@ export type SkillResult = {
   matched: boolean;
 };
 
-const SEMANTIC_THRESHOLD = 0.42;
+/** Minimum cosine for a semantic "hit" when scores are well spread (BGE/E5 + query/passage prefixes). */
+const SEMANTIC_FLOOR = 0.52;
 
 /**
  * Combine keyword flags with optional semantic scores (same order as skills array).
  * semanticScores[i] is max cosine vs resume chunks for skills[i], or null if skipped.
+ *
+ * Semantic matches use an **adaptive** cutoff: raw embedding similarity often clusters high
+ * for any professional text, which used to mark every skill as matched. We require similarity
+ * at least `SEMANTIC_FLOOR` and, when enough candidates exist, at least the batch **60th
+ * percentile** among keyword-missed skills so only clearer fits count.
  */
 export function combineMatches(
   skills: string[],
   keywordFlags: boolean[],
   semanticScores: (number | null)[],
 ): SkillResult[] {
+  const missedWithSem = skills
+    .map((_, i) => i)
+    .filter((i) => !(keywordFlags[i] ?? false) && semanticScores[i] != null);
+
+  const values = missedWithSem.map((i) => semanticScores[i] as number);
+  let semanticCutoff = SEMANTIC_FLOOR;
+  if (values.length >= 4) {
+    const sorted = [...values].sort((a, b) => a - b);
+    const p60 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.6))];
+    semanticCutoff = Math.max(SEMANTIC_FLOOR, p60);
+  } else if (values.length >= 2) {
+    const sorted = [...values].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    semanticCutoff = Math.max(SEMANTIC_FLOOR, median * 0.98);
+  }
+
   return skills.map((skill, i) => {
     const kw = keywordFlags[i] ?? false;
     const sem = semanticScores[i] ?? null;
-    const semanticOk = sem !== null && sem >= SEMANTIC_THRESHOLD;
+    const semanticOk = !kw && sem !== null && sem >= semanticCutoff;
     const matched = kw || semanticOk;
     return {
       skill,

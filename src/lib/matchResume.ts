@@ -27,6 +27,22 @@ export function splitResumeChunks(resume: string, maxChunks = 24): string[] {
   return chunks.slice(0, maxChunks);
 }
 
+/**
+ * BGE / E5 models are trained with asymmetric prefixes. Without them, cosine scores
+ * cluster high and everything looks like a "match".
+ */
+export function embedTextAsSkillQuery(skill: string): string {
+  const t = skill.trim();
+  if (!t) return t;
+  return `query: ${t}`;
+}
+
+export function embedTextAsResumePassage(chunk: string): string {
+  const t = chunk.trim();
+  if (!t) return t;
+  return `passage: ${t}`;
+}
+
 /** Fetch embeddings from our Next.js API (proxies Hugging Face). */
 export async function fetchEmbeddings(texts: string[]): Promise<number[][] | null> {
   if (texts.length === 0) return [];
@@ -62,8 +78,8 @@ export async function semanticScoresForSkills(
   let chunkEmb: number[][] | null;
 
   try {
-    skillEmb = await fetchEmbeddings(skills);
-    chunkEmb = await fetchEmbeddings(chunks);
+    skillEmb = await fetchEmbeddings(skills.map(embedTextAsSkillQuery));
+    chunkEmb = await fetchEmbeddings(chunks.map(embedTextAsResumePassage));
   } catch {
     return skills.map(() => null);
   }
